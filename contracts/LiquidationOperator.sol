@@ -264,7 +264,7 @@ contract LiquidationOperator is IUniswapV2Callee {
         console.log("User health factor is: %s.%s", healthFactor / 1e18, healthFactor % 1e18);
 
         require(totalDebt / 2 > 0, "No debt to liquidate");
-        console.log("User has debt: %s.%s", totalDebt / 1e6, totalDebt % 1e6);
+        console.log("User has USDT debt: %s.%s", totalDebt / 1e6, totalDebt % 1e6);
 
         // says this at aave docs https://aave.com/help/borrowing/liquidations
         // uint256 maxLiq = totalDebt / 2;
@@ -346,6 +346,7 @@ contract LiquidationOperator is IUniswapV2Callee {
         // local variable stack space saver
         {
             uint256 wethOut;
+            uint256 idealWethOut;
             uint256 out0 = 0;
             uint256 out1 = 0;
 
@@ -355,19 +356,23 @@ contract LiquidationOperator is IUniswapV2Callee {
 
             if (pairToken0 == WBTC) {
                 wethOut = getAmountOut(wbtcReceived, r0, r1);
+                idealWethOut = (wbtcReceived * r1) / r0;
                 out1 = wethOut;
             } else {
                 wethOut = getAmountOut(wbtcReceived, r1, r0);
+                idealWethOut = (wbtcReceived * r0) / r1;
                 out0 = wethOut;
             }
+
+            uint256 slippageAndFees = idealWethOut - wethOut;
+            console.log("Ideal WETH out: %s.%s", idealWethOut / 1e18, idealWethOut % 1e18);
+            console.log("WETH from WBTC swap: %s.%s", wethOut / 1e18, wethOut % 1e18);
+            console.log("Slippage: %s.%s", slippageAndFees / 1e18, slippageAndFees % 1e18);
 
             // transfer WBTC to the pair to swap
             IERC20(WBTC).transfer(WBTCWETHpair, wbtcReceived);
             swapPair.swap(out0, out1, address(this), bytes(""));
         }
-
-        uint256 wethAfterSwap = IERC20(WETH).balanceOf(address(this));
-        console.log("WETH from WBTC swap: %s.%s", wethAfterSwap / 1e18, wethAfterSwap % 1e18);
 
         // 2.3 repay
         //    *** Your code here ***
@@ -377,19 +382,22 @@ contract LiquidationOperator is IUniswapV2Callee {
             (uint112 fr0, uint112 fr1, ) = flashPair.getReserves();
 
             uint256 wethRepay;
+            uint256 idealWethRepay;
+
             if (fToken0 == USDT) {
                 wethRepay = getAmountIn(amount1, fr1, fr0);
+                idealWethRepay = (amount1 * fr1) / fr0;
             } else {
                 wethRepay = getAmountIn(amount1, fr0, fr1);
+                idealWethRepay = (amount1 * fr0) / fr1;
             }
 
+            uint256 slippageAndFees = (wethRepay - idealWethRepay);
+            console.log("Ideal WETH to repay loan: %s.%s", idealWethRepay / 1e18, idealWethRepay % 1e18);
             console.log("WETH to repay flash loan: %s.%s", wethRepay / 1e18, wethRepay % 1e18);
+            console.log("Slippage: %s.%s", slippageAndFees / 1e18, slippageAndFees % 1e18);
             // return;
             IERC20(WETH).transfer(WETHUSDTpair, wethRepay);
-
-            // calc results
-            uint256 remaining = IERC20(WETH).balanceOf(address(this));
-            console.log("WETH Profit: %s.%s", remaining / 1e18, remaining % 1e18);
         }
         // END TODO
     }
