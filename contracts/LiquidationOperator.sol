@@ -87,8 +87,9 @@ interface IERC20 {
      * Transfers _value amount of tokens to address _to, and MUST fire the Transfer event.
      * The function SHOULD throw if the message caller’s account balance does not have enough tokens to spend.
      * Lets msg.sender send pool tokens to an address.
+     * fixed this!!! usdt is so weird and doesnt allow transfers routing through
      **/
-    function transfer(address to, uint256 value) external returns (bool);
+    function transfer(address to, uint256 value) external;
 }
 
 // https://github.com/Uniswap/v2-periphery/blob/master/contracts/interfaces/IWETH.sol
@@ -174,6 +175,7 @@ contract LiquidationOperator is IUniswapV2Callee {
     // set these in constructor
     address immutable WETHUSDTpair;
     address immutable WBTCWETHpair;
+    address immutable WBTCUSDTpair;
 
     address payable private _owner;
 
@@ -217,17 +219,112 @@ contract LiquidationOperator is IUniswapV2Callee {
         amountIn = (numerator / denominator) + 1;
     }
 
+    function getSortedReserves(
+        address pair,
+        address tokenIn
+    ) internal view returns (uint112 reserveIn, uint112 reserveOut){
+        IUniswapV2Pair swapPair = IUniswapV2Pair(pair);
+        (uint112 r0, uint112 r1, ) = swapPair.getReserves();
+
+        if (tokenIn == swapPair.token0()) {
+            return (r0, r1);
+        } else {
+            return (r1, r0);
+        }
+    }
+
     constructor() {
         // TODO: (optional) initialize your contract
         _owner = payable(msg.sender);
         WETHUSDTpair = uniswapFactory.getPair(WETH, USDT);
         WBTCWETHpair = uniswapFactory.getPair(WBTC, WETH);
+        WBTCUSDTpair = uniswapFactory.getPair(WBTC, USDT);
         // END TODO
     }
 
     // TODO: add a `receive` function so that you can withdraw your WETH
     receive() external payable {}
     // END TODO
+
+    function _swapWBTCWETH(uint256 wbtcReceived) internal {
+        (uint112 rWBTC, uint112 rWETH) = getSortedReserves(WBTCWETHpair, WBTC);
+        (uint112 hoprWBTC, uint112 hoprUSDT) = getSortedReserves(WBTCUSDTpair, WBTC);
+        (uint112 hoprUSDT1, uint112 hoprWETH) = getSortedReserves(WETHUSDTpair, USDT);
+
+        uint256 bestTotalWeth = 0;
+        uint256 bestDirectSplit = 0;
+        
+        // abuse no gas to run some basic optimiser
+       
+        for (uint112 i = 1; i <= 19; i++) {
+            uint256 amtDirect = (wbtcReceived * i) / 20;
+            uint256 amtHop = wbtcReceived - amtDirect;
+
+            // single hop
+            uint256 outDirect = getAmountOut(amtDirect, rWBTC, rWETH);
+
+            // multi hop
+            uint256 outUSDC = getAmountOut(amtHop, hoprWBTC, hoprUSDT);
+            uint256 outHop = getAmountOut(outUSDC, hoprUSDT1, hoprWETH);
+
+            if (outDirect + outHop > bestTotalWeth) {
+                bestTotalWeth = outDirect + outHop;
+                bestDirectSplit = amtDirect;
+            }
+        }
+
+        console.log("Best direct split is: %s.%s", bestDirectSplit / 1e18, bestDirectSplit % 1e18);
+        console.log("Best total WETH output is: %s.%s", bestTotalWeth / 1e18, bestTotalWeth % 1e18);
+
+        if (bestDirectSplit > 0) {
+            IERC20(WBTC).transfer(WBTCWETHpair, bestDirectSplit);
+            uint256 outWethDirect = getAmountOut(bestDirectSplit, rWBTC, rWETH);
+
+            (uint swap0, uint swap1) = (WBTC < WETH) ? (uint(0), outWethDirect) : (outWethDirect, uint(0));
+            IUniswapV2Pair(WBTCWETHpair).swap(swap0, swap1, address(this), new bytes(0));
+        }
+
+        if(wbtcReceived - bestDirectSplit > 0) {
+            IERC20(WBTC).transfer(WBTCUSDTpair, wbtcReceived - bestDirectSplit);
+            uint256 outUSDT = getAmountOut(wbtcReceived - bestDirectSplit, hoprWBTC, hoprUSDT);
+
+            (uint swap0, uint swap1) = (WBTC < USDT) ? (uint(0), outUSDT) : (outUSDT, uint(0));
+            IUniswapV2Pair(WBTCUSDTpair).swap(swap0, swap1, address(this), new bytes(0));
+
+            uint256 usdtBalance = IERC20(USDT).balanceOf(address(this));
+            IERC20(USDT).transfer(WETHUSDTpair, usdtBalance);
+            uint256 finalWethHop = getAmountOut(usdtBalance, hoprUSDT1, hoprWETH);
+
+            (swap0, swap1) = (USDT < WETH) ? (uint(0), finalWethHop) : (finalWethHop, uint(0));
+            IUniswapV2Pair(WETHUSDTpair).swap(swap0, swap1, address(this), new bytes(0));
+        }
+
+        console.log("WETH after swap: %s.%s", IERC20(WETH).balanceOf(address(this)) / 1e18, IERC20(WETH).balanceOf(address(this)) % 1e18);
+    }
+
+    function _repayFlashLoan(uint256 amountBorrowed) internal {
+        IUniswapV2Pair flashPair = IUniswapV2Pair(WETHUSDTpair);
+        address fToken0 = flashPair.token0();
+        (uint112 fr0, uint112 fr1, ) = flashPair.getReserves();
+
+        uint256 wethRepay;
+        uint256 idealWethRepay;
+
+        if (fToken0 == USDT) {
+            wethRepay = getAmountIn(amountBorrowed, fr1, fr0);
+            idealWethRepay = (amountBorrowed * fr1) / fr0;
+        } else {
+            wethRepay = getAmountIn(amountBorrowed, fr0, fr1);
+            idealWethRepay = (amountBorrowed * fr0) / fr1;
+        }
+
+        uint256 slippageAndFees = (wethRepay - idealWethRepay);
+        console.log("Ideal WETH to repay loan: %s.%s", idealWethRepay / 1e18, idealWethRepay % 1e18);
+        console.log("WETH to repay flash loan: %s.%s", wethRepay / 1e18, wethRepay % 1e18);
+        console.log("Slippage: %s.%s", slippageAndFees / 1e18, slippageAndFees % 1e18);
+        // return;
+        IERC20(WETH).transfer(WETHUSDTpair, wethRepay);
+    }
 
     // required by the testing script, entry for your liquidation call
     function operate() external {
@@ -344,61 +441,11 @@ contract LiquidationOperator is IUniswapV2Callee {
         // 2.2 swap WBTC for other things or repay directly
 
         // local variable stack space saver
-        {
-            uint256 wethOut;
-            uint256 idealWethOut;
-            uint256 out0 = 0;
-            uint256 out1 = 0;
-
-            IUniswapV2Pair swapPair = IUniswapV2Pair(WBTCWETHpair);
-            address pairToken0 = swapPair.token0();
-            (uint112 r0, uint112 r1, ) = swapPair.getReserves();
-
-            if (pairToken0 == WBTC) {
-                wethOut = getAmountOut(wbtcReceived, r0, r1);
-                idealWethOut = (wbtcReceived * r1) / r0;
-                out1 = wethOut;
-            } else {
-                wethOut = getAmountOut(wbtcReceived, r1, r0);
-                idealWethOut = (wbtcReceived * r0) / r1;
-                out0 = wethOut;
-            }
-
-            uint256 slippageAndFees = idealWethOut - wethOut;
-            console.log("Ideal WETH out: %s.%s", idealWethOut / 1e18, idealWethOut % 1e18);
-            console.log("WETH from WBTC swap: %s.%s", wethOut / 1e18, wethOut % 1e18);
-            console.log("Slippage: %s.%s", slippageAndFees / 1e18, slippageAndFees % 1e18);
-
-            // transfer WBTC to the pair to swap
-            IERC20(WBTC).transfer(WBTCWETHpair, wbtcReceived);
-            swapPair.swap(out0, out1, address(this), bytes(""));
-        }
+        _swapWBTCWETH(wbtcReceived);
 
         // 2.3 repay
-        //    *** Your code here ***
-        {
-            IUniswapV2Pair flashPair = IUniswapV2Pair(WETHUSDTpair);
-            address fToken0 = flashPair.token0();
-            (uint112 fr0, uint112 fr1, ) = flashPair.getReserves();
-
-            uint256 wethRepay;
-            uint256 idealWethRepay;
-
-            if (fToken0 == USDT) {
-                wethRepay = getAmountIn(amount1, fr1, fr0);
-                idealWethRepay = (amount1 * fr1) / fr0;
-            } else {
-                wethRepay = getAmountIn(amount1, fr0, fr1);
-                idealWethRepay = (amount1 * fr0) / fr1;
-            }
-
-            uint256 slippageAndFees = (wethRepay - idealWethRepay);
-            console.log("Ideal WETH to repay loan: %s.%s", idealWethRepay / 1e18, idealWethRepay % 1e18);
-            console.log("WETH to repay flash loan: %s.%s", wethRepay / 1e18, wethRepay % 1e18);
-            console.log("Slippage: %s.%s", slippageAndFees / 1e18, slippageAndFees % 1e18);
-            // return;
-            IERC20(WETH).transfer(WETHUSDTpair, wethRepay);
-        }
+        _repayFlashLoan(amount1);
+        
         // END TODO
     }
 }
