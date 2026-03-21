@@ -166,6 +166,7 @@ contract LiquidationOperator is IUniswapV2Callee {
     address constant USDT = 0xdAC17F958D2ee523a2206206994597C13D831ec7;
     address constant WBTC = 0x2260FAC5E5542a773Aa44fBCfeDf7C193bc2C599;
     address constant WETH = 0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2;
+    address constant DAI = 0x6B175474E89094C44Da98b954EedeAC495271d0F;
 
     //uniswap v2 stuff
     IUniswapV2Factory constant uniswapFactory = IUniswapV2Factory(0x5C69bEe701ef814a2B6a3EDD4B1652CB9cc5aA6f);
@@ -176,6 +177,8 @@ contract LiquidationOperator is IUniswapV2Callee {
     address immutable WETHUSDTpair;
     address immutable WBTCWETHpair;
     address immutable WBTCUSDTpair;
+    address immutable WBTCDAIpair;
+    address immutable WETHDAIpair;
 
     address payable private _owner;
 
@@ -239,6 +242,8 @@ contract LiquidationOperator is IUniswapV2Callee {
         WETHUSDTpair = uniswapFactory.getPair(WETH, USDT);
         WBTCWETHpair = uniswapFactory.getPair(WBTC, WETH);
         WBTCUSDTpair = uniswapFactory.getPair(WBTC, USDT);
+        WBTCDAIpair = uniswapFactory.getPair(WBTC, DAI);
+        WETHDAIpair = uniswapFactory.getPair(WETH, DAI);
         // END TODO
     }
 
@@ -248,32 +253,42 @@ contract LiquidationOperator is IUniswapV2Callee {
 
     function _swapWBTCWETH(uint256 wbtcReceived) internal {
         (uint112 rWBTC, uint112 rWETH) = getSortedReserves(WBTCWETHpair, WBTC);
-        (uint112 hoprWBTC, uint112 hoprUSDT) = getSortedReserves(WBTCUSDTpair, WBTC);
-        (uint112 hoprUSDT1, uint112 hoprWETH) = getSortedReserves(WETHUSDTpair, USDT);
+        (uint112 hoprWBTC, uint112 hoprDAI) = getSortedReserves(WBTCDAIpair, WBTC);
+        (uint112 hoprDAI1, uint112 hoprWETH) = getSortedReserves(WETHDAIpair, DAI);
 
         uint256 bestTotalWeth = 0;
         uint256 bestDirectSplit = 0;
+        uint112 bestI;
         
         // abuse no gas to run some basic optimiser
        
-        for (uint112 i = 1; i <= 19; i++) {
+        for (uint112 i = 0; i <= 20; i++) {
             uint256 amtDirect = (wbtcReceived * i) / 20;
             uint256 amtHop = wbtcReceived - amtDirect;
+            uint256 outDirect = 0;
+            uint256 outHop = 0;
 
             // single hop
-            uint256 outDirect = getAmountOut(amtDirect, rWBTC, rWETH);
+            if (i != 0) {
+                outDirect = getAmountOut(amtDirect, rWBTC, rWETH);
+            }
 
             // multi hop
-            uint256 outUSDC = getAmountOut(amtHop, hoprWBTC, hoprUSDT);
-            uint256 outHop = getAmountOut(outUSDC, hoprUSDT1, hoprWETH);
+            
+            if (i != 20) {
+                uint256 outUSDC = getAmountOut(amtHop, hoprWBTC, hoprDAI);
+                outHop = getAmountOut(outUSDC, hoprDAI1, hoprWETH);
+            }
 
             if (outDirect + outHop > bestTotalWeth) {
                 bestTotalWeth = outDirect + outHop;
                 bestDirectSplit = amtDirect;
+                bestI = i;
             }
         }
 
-        console.log("Best direct split is: %s.%s", bestDirectSplit / 1e18, bestDirectSplit % 1e18);
+        console.log("Best i: ", bestI);
+        console.log("WBTC direct swap: %s.%s", bestDirectSplit / 1e8, bestDirectSplit % 1e8);
         console.log("Best total WETH output is: %s.%s", bestTotalWeth / 1e18, bestTotalWeth % 1e18);
 
         if (bestDirectSplit > 0) {
@@ -285,18 +300,18 @@ contract LiquidationOperator is IUniswapV2Callee {
         }
 
         if(wbtcReceived - bestDirectSplit > 0) {
-            IERC20(WBTC).transfer(WBTCUSDTpair, wbtcReceived - bestDirectSplit);
-            uint256 outUSDT = getAmountOut(wbtcReceived - bestDirectSplit, hoprWBTC, hoprUSDT);
+            IERC20(WBTC).transfer(WBTCDAIpair, wbtcReceived - bestDirectSplit);
+            uint256 outUSDT = getAmountOut(wbtcReceived - bestDirectSplit, hoprWBTC, hoprDAI);
 
-            (uint swap0, uint swap1) = (WBTC < USDT) ? (uint(0), outUSDT) : (outUSDT, uint(0));
-            IUniswapV2Pair(WBTCUSDTpair).swap(swap0, swap1, address(this), new bytes(0));
+            (uint swap0, uint swap1) = (WBTC < DAI) ? (uint(0), outUSDT) : (outUSDT, uint(0));
+            IUniswapV2Pair(WBTCDAIpair).swap(swap0, swap1, address(this), new bytes(0));
 
-            uint256 usdtBalance = IERC20(USDT).balanceOf(address(this));
-            IERC20(USDT).transfer(WETHUSDTpair, usdtBalance);
-            uint256 finalWethHop = getAmountOut(usdtBalance, hoprUSDT1, hoprWETH);
+            uint256 usdtBalance = IERC20(DAI).balanceOf(address(this));
+            IERC20(DAI).transfer(WETHDAIpair, usdtBalance);
+            uint256 finalWethHop = getAmountOut(usdtBalance, hoprDAI1, hoprWETH);
 
-            (swap0, swap1) = (USDT < WETH) ? (uint(0), finalWethHop) : (finalWethHop, uint(0));
-            IUniswapV2Pair(WETHUSDTpair).swap(swap0, swap1, address(this), new bytes(0));
+            (swap0, swap1) = (DAI < WETH) ? (uint(0), finalWethHop) : (finalWethHop, uint(0));
+            IUniswapV2Pair(WETHDAIpair).swap(swap0, swap1, address(this), new bytes(0));
         }
 
         console.log("WETH after swap: %s.%s", IERC20(WETH).balanceOf(address(this)) / 1e18, IERC20(WETH).balanceOf(address(this)) % 1e18);
