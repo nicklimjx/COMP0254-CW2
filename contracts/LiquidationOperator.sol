@@ -113,6 +113,8 @@ interface IProtocolOracle {
     function getAssetPrice(address asset) external view returns (uint256);
 }
 
+interface ICurve {
+}
 // balancer v2
 // 0% flash loan, good life, save money
 interface IBPool {
@@ -268,7 +270,7 @@ contract LiquidationOperator is IFlashLoanRecipient {
     address immutable WBTCWETHuni;
     address immutable WBTCDAIuni;
     address immutable WETHDAIuni;
-    
+
     address immutable WBTCWETHsushi;
     address immutable WETHDAIsushi;
     address immutable WETHUSDTsushi;
@@ -277,6 +279,7 @@ contract LiquidationOperator is IFlashLoanRecipient {
 
     address payable private _owner;
 
+    // helper functions
     function getAmountOut(
         uint256 amountIn,
         uint256 reserveIn,
@@ -323,6 +326,14 @@ contract LiquidationOperator is IFlashLoanRecipient {
         } else {
             return (r1, r0);
         }
+    }
+
+    function getSortedOut(
+        address tokenIn,
+        address tokenOut,
+        uint256 amountOut
+    ) internal pure returns(uint256 amount0Out, uint256 amount1Out){
+        return tokenIn < tokenOut ? (uint256(0), amountOut) : (amountOut, uint256(0));
     }
 
     constructor() {
@@ -471,9 +482,60 @@ contract LiquidationOperator is IFlashLoanRecipient {
         console.log("Sushi WETH/USDT | WETH: %s, USDT: %s", formatUnits(r0, 18), formatUnits(r1, 6));
     }
 
-    // function makeFlashLoan(IERC20[] memory tokens, uint256[] memory amounts, bytes memory userData) external {
-    //     vault.flashLoan(this, tokens, amounts, userData);
-    // }
+    function _swapWBTCWETH(uint256 wbtcReceived) internal {
+        uint256 inUni = 2929335114; 
+        uint256 inSushi = wbtcReceived - inUni;
+        uint256 outUni;
+        uint256 outSushi;
+        
+        // uniswap
+        (uint256 r0, uint256 r1) = getSortedReserves(WBTCWETHuni, WBTC);
+        outUni = getAmountOut(inUni, r0, r1);
+        (uint256 amount0Out, uint256 amount1Out) = getSortedOut(WBTC, WETH, outUni);
+        
+        IERC20(WBTC).transfer(WBTCWETHuni, inUni);
+        IUniswapV2Pair(WBTCWETHuni).swap(amount0Out, amount1Out, address(this), bytes(""));
+
+        // sushiswap
+        (r0, r1) = getSortedReserves(WBTCWETHsushi, WBTC);
+        outSushi = getAmountOut(inSushi, r0, r1);
+        (amount0Out, amount1Out) = getSortedOut(WBTC, WETH, outSushi);
+
+        IERC20(WBTC).transfer(WBTCWETHsushi, inSushi);
+        IUniswapV2Pair(WBTCWETHsushi).swap(amount0Out, amount1Out, address(this), bytes(""));
+
+        uint256 wethOut = outSushi + outUni;
+        console.log("WETH from WBTC swap: %s", formatUnits(wethOut, 18));
+    }
+
+    function _swapWETHUSDT(uint256 usdtOut) internal {
+        uint256 outUni = 1310806629343;
+        uint256 outSushi = usdtOut - outUni; 
+        uint256 inUni;
+        uint256 inSushi;
+
+        // uniswap
+        (uint256 r0, uint256 r1) = getSortedReserves(WETHUSDTuni, WETH);
+        inUni = getAmountIn(outUni, r0, r1);
+        (uint256 amount0Out, uint256 amount1Out) = getSortedOut(WETH, USDT, outUni);
+        
+        IERC20(WETH).transfer(WETHUSDTuni, inUni);
+        IUniswapV2Pair(WETHUSDTuni).swap(amount0Out, amount1Out, address(this), bytes(""));
+
+        // sushiswap (Fixed pair, tokens, and math)
+        (r0, r1) = getSortedReserves(WETHUSDTsushi, WETH);
+        inSushi = getAmountIn(outSushi, r0, r1);
+        (amount0Out, amount1Out) = getSortedOut(WETH, USDT, outSushi);
+
+        IERC20(WETH).transfer(WETHUSDTsushi, inSushi);
+        IUniswapV2Pair(WETHUSDTsushi).swap(amount0Out, amount1Out, address(this), bytes(""));
+
+        console.log("Swapped WETH to USDT");
+    }
+
+    function makeFlashLoan(IERC20[] memory tokens, uint256[] memory amounts, bytes memory userData) internal {
+        vault.flashLoan(this, tokens, amounts, userData);
+    }
 
     function receiveFlashLoan(
         IERC20[] memory tokens,
@@ -481,327 +543,58 @@ contract LiquidationOperator is IFlashLoanRecipient {
         uint256[] memory feeAmounts,
         bytes memory userData
     ) external override {
-    //     require(msg.sender == address(vault));
-    //     IERC20(USDT).approve(address(lendingPool), amounts[0]);    // aave needs this so the contract can take the money
+        require(msg.sender == address(vault));
+        IERC20(USDT).approve(address(lendingPool), amounts[0]);    // aave needs this so the contract can take the money
 
     // // //     // 2.1 liquidate the target user
     // // //     //    *** Your code here ***
-    //     lendingPool.liquidationCall(
-    //         WBTC,
-    //         USDT,
-    //         TARGET_USER,
-    //         amounts[0],
-    //         false
-    //     );
+        lendingPool.liquidationCall(
+            WBTC,
+            USDT,
+            TARGET_USER,
+            amounts[0],
+            false
+        );
 
-    //     uint256 wbtcReceived = IERC20(WBTC).balanceOf(address(this));
-    //     console.log("WBTC from liquidation: %s", formatUnits(wbtcReceived, 8));
+        uint256 wbtcReceived = IERC20(WBTC).balanceOf(address(this));
+        console.log("WBTC from liquidation: %s", formatUnits(wbtcReceived, 8));
 
-    // //     // 2.2 swap WBTC for other things or repay directly
-    //     uint256 wethOut;
-    //     uint256 out0 = 0;
-    //     uint256 out1 = 0;
-
-    //     IUniswapV2Pair swap1uni = IUniswapV2Pair(WBTCWETHuni);
-    //     IUniswapV2Pair swap2uni = IUniswapV2Pair(WETHUSDTuni);
-    //     IUniswapV2Pair swapSushi = IUniswapV2Pair(WBTCWETHsushi);
-
-
-    //     console.log("WETH from WBTC swap: %s.%s", wethOut / 1e18, wethOut % 1e18);
-
-    //     // transfer WBTC to the pair to swap
-    //     IERC20(WBTC).transfer(WBTCWETHuni, wbtcReceived);
-    //     swapUni.swap(out0, out1, address(this), bytes(""));
+        // 2.2 swap WBTC for other things or repay directly
+        _swapWBTCWETH(wbtcReceived);
+        _swapWETHUSDT(amounts[0]);
     //     // local variable stack space saver
     //     // _swapWBTCWETH(wbtcReceived);
 
-    //     // // 2.3 repay
-    //     // //    *** Your code here ***
-    //     // _repayFlashLoan(amount1);
-
-    //     // Return loan
-    //     for (uint256 i = 0; i < tokens.length; i++) {
-    //         tokens[i].transfer(address(vault), amounts[i] + feeAmounts[i]);
-    //     }
+        // 2.3 repay
+        for (uint256 i = 0; i < tokens.length; i++) {
+            tokens[i].transfer(address(vault), amounts[i] + feeAmounts[i]);
+        }
     }
 
     function operate() external {
         _getSolverInfo();
-        // IERC20[] memory tokens = new IERC20[](1);
-        // tokens[0] = IERC20(USDT);
-        // uint256[] memory amounts = new uint256[](1);
-        // amounts[0] = 2916378221684;
-        // uint256[] memory feeAmounts = new uint256[](1);
-        // feeAmounts[0] = 0;
-        // bytes memory userData = "";
+        IERC20[] memory tokens = new IERC20[](1);
+        tokens[0] = IERC20(USDT);
 
-        // makeFlashLoan(tokens, amounts, userData);
-        // receiveFlashLoan(tokens, amounts, feeAmounts, userData);
-        // uint256 wethBalance = IERC20(WETH).balanceOf(address(this));
-        // if (wethBalance > 0) {
-        //     IWETH(WETH).withdraw(wethBalance);
-        // }
+        uint256[] memory amounts = new uint256[](1);
+        amounts[0] = 2916378221684;
+
+        uint256[] memory feeAmounts = new uint256[](1);
+        feeAmounts[0] = 0;
+
+        bytes memory userData = "";
+
+        makeFlashLoan(tokens, amounts, userData);
+        uint256 wethBalance = IERC20(WETH).balanceOf(address(this));
+        if (wethBalance > 0) {
+            IWETH(WETH).withdraw(wethBalance);
+        }
 
         // // return ETH balance to caller
-        // uint256 ethBalance = address(this).balance;
-        // if (ethBalance > 0) {
-        //     (bool success, ) = _owner.call{value:ethBalance}("");
-        //     require(success, "ETH transfer failed");
-        // }
+        uint256 ethBalance = address(this).balance;
+        if (ethBalance > 0) {
+            (bool success, ) = _owner.call{value:ethBalance}("");
+            require(success, "ETH transfer failed");
+        }
     }
 }
-
-// contract LiquidationOperator is IUniswapV2Callee {
-//     uint8 public constant health_factor_decimals = 18;
-
-//     // TODO: define constants used in the contract including ERC-20 tokens, Uniswap Pairs, Aave lending pools, etc. */
-//     //    *** Your code here ***
-//     // aave contracts
-//     ILendingPool constant lendingPool = ILendingPool(0x7d2768dE32b0b80b7a3454c06BdAc94A69DDc7A9);
-//     IProtocolDataProvider constant dataProvider = IProtocolDataProvider(0x057835Ad21a177dbdd3090bB1CAE03EaCF78Fc6d);
-
-//     address constant USDT = 0xdAC17F958D2ee523a2206206994597C13D831ec7;
-//     address constant WBTC = 0x2260FAC5E5542a773Aa44fBCfeDf7C193bc2C599;
-//     address constant WETH = 0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2;
-
-//     //uniswap v2 stuff
-//     IUniswapV2Factory constant uniswapFactory = IUniswapV2Factory(0x5C69bEe701ef814a2B6a3EDD4B1652CB9cc5aA6f);
-
-//     address constant TARGET_USER = 0x59CE4a2AC5bC3f5F225439B2993b86B42f6d3e9F;
-
-//     // set these in constructor
-//     address immutable WETHUSDTuni;
-//     address immutable WBTCWETHuni;
-
-//     address payable private _owner;
-
-//     // END TODO
-
-//     // some helper function, it is totally fine if you can finish the lab without using these function
-//     // https://github.com/Uniswap/v2-periphery/blob/master/contracts/libraries/UniswapV2Library.sol
-//     // given an input amount of an asset and pair reserves, returns the maximum output amount of the other asset
-//     // safe mul is not necessary since https://docs.soliditylang.org/en/v0.8.9/080-breaking-changes.html
-//     function getAmountOut(
-//         uint256 amountIn,
-//         uint256 reserveIn,
-//         uint256 reserveOut
-//     ) internal pure returns (uint256 amountOut) {
-//         require(amountIn > 0, "UniswapV2Library: INSUFFICIENT_INPUT_AMOUNT");
-//         require(
-//             reserveIn > 0 && reserveOut > 0,
-//             "UniswapV2Library: INSUFFICIENT_LIQUIDITY"
-//         );
-//         uint256 amountInWithFee = amountIn * 997;
-//         uint256 numerator = amountInWithFee * reserveOut;
-//         uint256 denominator = reserveIn * 1000 + amountInWithFee;
-//         amountOut = numerator / denominator;
-//     }
-
-//     // some helper function, it is totally fine if you can finish the lab without using these function
-//     // given an output amount of an asset and pair reserves, returns a required input amount of the other asset
-//     // safe mul is not necessary since https://docs.soliditylang.org/en/v0.8.9/080-breaking-changes.html
-//     function getAmountIn(
-//         uint256 amountOut,
-//         uint256 reserveIn,
-//         uint256 reserveOut
-//     ) internal pure returns (uint256 amountIn) {
-//         require(amountOut > 0, "UniswapV2Library: INSUFFICIENT_OUTPUT_AMOUNT");
-//         require(
-//             reserveIn > 0 && reserveOut > 0,
-//             "UniswapV2Library: INSUFFICIENT_LIQUIDITY"
-//         );
-//         uint256 numerator = reserveIn * amountOut * 1000;
-//         uint256 denominator = (reserveOut - amountOut) * 997;
-//         amountIn = (numerator / denominator) + 1;
-//     }
-
-//     constructor() {
-//         // TODO: (optional) initialize your contract
-//         _owner = payable(msg.sender);
-//         WETHUSDTuni = uniswapFactory.getPair(WETH, USDT);
-//         WBTCWETHuni = uniswapFactory.getPair(WBTC, WETH);
-//         // END TODO
-//     }
-
-//     // TODO: add a `receive` function so that you can withdraw your WETH
-//     receive() external payable {}
-//     // END TODO
-
-//     function _swapWBTCWETH(uint256 wbtcReceived) internal {
-//         uint256 wethOut;
-//         uint256 idealWethOut;
-//         uint256 out0 = 0;
-//         uint256 out1 = 0;
-
-//         IUniswapV2Pair swapPair = IUniswapV2Pair(WBTCWETHuni);
-//         address pairToken0 = swapPair.token0();
-//         (uint112 r0, uint112 r1, ) = swapPair.getReserves();
-
-//         if (pairToken0 == WBTC) {
-//             wethOut = getAmountOut(wbtcReceived, r0, r1);
-//             idealWethOut = (wbtcReceived * r1) / r0;
-//             out1 = wethOut;
-//         } else {
-//             wethOut = getAmountOut(wbtcReceived, r1, r0);
-//             idealWethOut = (wbtcReceived * r0) / r1;
-//             out0 = wethOut;
-//         }
-
-//         uint256 slippageAndFees = idealWethOut - wethOut;
-//         console.log("Ideal WETH out: %s.%s", idealWethOut / 1e18, idealWethOut % 1e18);
-//         console.log("WETH from WBTC swap: %s.%s", wethOut / 1e18, wethOut % 1e18);
-//         console.log("Slippage: %s.%s", slippageAndFees / 1e18, slippageAndFees % 1e18);
-
-//         // transfer WBTC to the pair to swap
-//         IERC20(WBTC).transfer(WBTCWETHuni, wbtcReceived);
-//         swapPair.swap(out0, out1, address(this), bytes(""));
-//     }
-
-//     function _repayFlashLoan(uint256 amountBorrowed) internal {
-//         IUniswapV2Pair flashPair = IUniswapV2Pair(WETHUSDTuni);
-//         address fToken0 = flashPair.token0();
-//         (uint112 fr0, uint112 fr1, ) = flashPair.getReserves();
-
-//         uint256 wethRepay;
-//         uint256 idealWethRepay;
-
-//         if (fToken0 == USDT) {
-//             wethRepay = getAmountIn(amountBorrowed, fr1, fr0);
-//             idealWethRepay = (amountBorrowed * fr1) / fr0;
-//         } else {
-//             wethRepay = getAmountIn(amountBorrowed, fr0, fr1);
-//             idealWethRepay = (amountBorrowed * fr0) / fr1;
-//         }
-
-//         uint256 slippageAndFees = (wethRepay - idealWethRepay);
-//         console.log("Ideal WETH to repay loan: %s.%s", idealWethRepay / 1e18, idealWethRepay % 1e18);
-//         console.log("WETH to repay flash loan: %s.%s", wethRepay / 1e18, wethRepay % 1e18);
-//         console.log("Slippage: %s.%s", slippageAndFees / 1e18, slippageAndFees % 1e18);
-//         // return;
-//         IERC20(WETH).transfer(WETHUSDTuni, wethRepay);
-//     }
-
-//     // required by the testing script, entry for your liquidation call
-//     function operate() external {
-//         // TODO: implement your liquidation logic
-
-//         uint256 healthFactor;
-//         // 0. security checks and initializing variables
-//         (
-//             ,
-//             ,
-//             ,
-//             ,
-//             ,
-//             healthFactor
-//         ) = lendingPool.getUserAccountData(TARGET_USER);
-
-//         (
-//             ,
-//             uint256 currentStableDebt,
-//             uint256 currentVariableDebt,
-//             ,
-//             ,
-//             ,
-//             ,
-//             ,
-            
-//         ) = dataProvider.getUserReserveData(USDT, TARGET_USER);
-
-//         uint256 totalDebt = currentStableDebt + currentVariableDebt;
-
-//         // 1. get the target user account data & make sure it is liquidatable
-        
-//         require(healthFactor < 1e18, "Target user is not liquidatable");   // aave returns as uint256
-//         console.log("User health factor is: %s.%s", healthFactor / 1e18, healthFactor % 1e18);
-
-//         require(totalDebt / 2 > 0, "No debt to liquidate");
-//         console.log("User has USDT debt: %s.%s", totalDebt / 1e6, totalDebt % 1e6);
-
-//         // says this at aave docs https://aave.com/help/borrowing/liquidations
-//         // uint256 maxLiq = totalDebt / 2;
-//         // debug
-//         uint256 maxLiq = 2916378221684;
-
-//         // if (false) {
-//         //     maxLiq = totalDebt;
-//         // } else {
-//         //     maxLiq = totalDebt / 2;
-//         // }
-//         // 2. call flash swap to liquidate the target user
-//         // based on https://etherscan.io/tx/0xac7df37a43fab1b130318bbb761861b8357650db2e2c6493b73d6da3d9581077
-//         // we know that the target user borrowed USDT with WBTC as collateral
-//         // we should borrow USDT, liquidate the target user and get the WBTC, then swap WBTC to repay uniswap
-//         // (please feel free to develop other workflows as long as they liquidate the target user successfully)
-//         //    *** Your code here ***
-//         IUniswapV2Pair flashPair = IUniswapV2Pair(WETHUSDTuni);
-//         address token0 = flashPair.token0();
-
-//         uint256 amount0Out = 0;
-//         uint256 amount1Out = 0;
-//         if (token0 == USDT) {
-//             amount0Out = maxLiq;
-//         } else {
-//             amount1Out = maxLiq;
-//         }
-        
-//         flashPair.swap(amount0Out, amount1Out, address(this), bytes("1"));
-//         // add uniswapv2callee here
-//         // because data length is mroe than 0 it calls uniSwapV2call
-//         // 3. Convert the profit into ETH and send back to sender
-//         uint256 wethBalance = IERC20(WETH).balanceOf(address(this));
-//         if (wethBalance > 0) {
-//             IWETH(WETH).withdraw(wethBalance);
-//         }
-
-//         // return ETH balance to caller
-//         uint256 ethBalance = address(this).balance;
-//         if (ethBalance > 0) {
-//             (bool success, ) = _owner.call{value:ethBalance}("");
-//             require(success, "ETH transfer failed");
-//         }
-//         // END TODO
-//     }
-
-//     // required by the swap
-//     function uniswapV2Call(
-//         address,
-//         uint256,
-//         uint256 amount1,
-//         bytes calldata
-//     ) external override {
-//         // TODO: implement your liquidation logic
-//         console.log("USDT flash loaned: %s.%s", amount1 / 1e6, amount1 % 1e6);
-
-//         // 2.0. security checks and initializing variables
-//         // copied from uniswap docs
-//         assert(msg.sender == IUniswapV2Factory(uniswapFactory).getPair(
-//             IUniswapV2Pair(msg.sender).token0(),
-//             IUniswapV2Pair(msg.sender).token1()
-//             ));
-//         IERC20(USDT).approve(address(lendingPool), amount1);    // aave needs this so the contract can take the money
-
-//         // 2.1 liquidate the target user
-//         //    *** Your code here ***
-//         lendingPool.liquidationCall(
-//             WBTC,
-//             USDT,
-//             TARGET_USER,
-//             amount1,
-//             false
-//         );
-
-//         uint256 wbtcReceived = IERC20(WBTC).balanceOf(address(this));
-//         console.log("WBTC from liquidation: %s.%s", wbtcReceived / 1e8, wbtcReceived % 1e8);
-
-//         // 2.2 swap WBTC for other things or repay directly
-
-//         // local variable stack space saver
-//         _swapWBTCWETH(wbtcReceived);
-
-//         // 2.3 repay
-//         //    *** Your code here ***
-//         _repayFlashLoan(amount1);
-//         // END TODO
-//     }
-// }
