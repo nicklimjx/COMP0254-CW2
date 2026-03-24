@@ -277,6 +277,7 @@ contract LiquidationOperator is ICallee {
     address constant WBTC = 0x2260FAC5E5542a773Aa44fBCfeDf7C193bc2C599;
     address constant WETH = 0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2;
     address constant DAI = 0x6B175474E89094C44Da98b954EedeAC495271d0F;
+    address constant USDC = 0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48;
 
     //uniswap v2 stuff
     IUniswapV2Factory constant uniswapFactory = IUniswapV2Factory(0x5C69bEe701ef814a2B6a3EDD4B1652CB9cc5aA6f);
@@ -290,10 +291,13 @@ contract LiquidationOperator is ICallee {
     address immutable WBTCWETHuni;
     address immutable WBTCDAIuni;
     address immutable WETHDAIuni;
+    address immutable WETHUSDCuni;
+    address immutable WBTCUSDCuni;
 
     address immutable WBTCWETHsushi;
     address immutable WETHDAIsushi;
     address immutable WETHUSDTsushi;
+    address immutable WETHUSDCsushi;
     // address immutable WBTCDAIsushi;
     // WBTCUSDTsushi did not exist at this time
 
@@ -367,6 +371,10 @@ contract LiquidationOperator is ICallee {
         WBTCWETHsushi = sushiFactory.getPair(WBTC, WETH);
         WETHDAIsushi = sushiFactory.getPair(WETH, DAI);
         WETHUSDTsushi = sushiFactory.getPair(WETH, USDT);
+        
+        WETHUSDCuni = uniswapFactory.getPair(WETH, USDC);
+        WBTCUSDCuni = uniswapFactory.getPair(WBTC, USDC);
+        WETHUSDCsushi = sushiFactory.getPair(WETH, USDC);
         // END TODO
     }
 
@@ -484,6 +492,12 @@ contract LiquidationOperator is ICallee {
         (r0, r1) = getSortedReserves(WETHDAIuni, WETH);
         console.log("Uni WETH/DAI  | WETH: %s, DAI: %s", formatUnits(r0, 18), formatUnits(r1, 18));
 
+        (r0, r1) = getSortedReserves(WETHUSDCuni, WETH);
+        console.log("Uni WETH/USDC | WETH: %s, USDC: %s", formatUnits(r0, 18), formatUnits(r1, 6));
+
+        (r0, r1) = getSortedReserves(WBTCUSDCuni, WBTC);
+        console.log("Uni WBTC/USDC | WBTC: %s, USDC: %s", formatUnits(r0, 8), formatUnits(r1, 6));
+
         // SushiSwap Pools
         (r0, r1) = getSortedReserves(WBTCWETHsushi, WBTC);
         console.log("Sushi WBTC/WETH | WBTC: %s, WETH: %s", formatUnits(r0, 8), formatUnits(r1, 18));
@@ -493,6 +507,9 @@ contract LiquidationOperator is ICallee {
 
         (r0, r1) = getSortedReserves(WETHUSDTsushi, WETH);
         console.log("Sushi WETH/USDT | WETH: %s, USDT: %s", formatUnits(r0, 18), formatUnits(r1, 6));
+
+        (r0, r1) = getSortedReserves(WETHUSDCsushi, WETH);
+        console.log("Sushi WETH/USDC | WETH: %s, USDC: %s", formatUnits(r0, 18), formatUnits(r1, 6));
     }
 
     function _swapWBTCWETH(uint256 wbtcReceived) internal {
@@ -521,60 +538,97 @@ contract LiquidationOperator is ICallee {
         console.log("WETH from WBTC swap: %s", formatUnits(wethOut, 18));
     }
 
-    function _swapWETHDAI(uint256 daiOut) internal {
-        uint256 wethIn;
-        uint256 outUni = 970018074860588300000000; // precomputed magic number
-        uint256 outSushi = daiOut - outUni; 
-        uint256 inUni;
-        uint256 inSushi;
+    function _swapWETHStable(uint256 stableOut) internal {
+        uint256 totalWethIn;
 
-        // uniswap
+        // (WETH -> DAI -> USDC via Curve)
+        uint256 daiTargetUni = 352744444560641422867775; 
+        uint256 daiTargetSushi = 697992533580712391994894; 
+        uint256 totalDaiToGet = daiTargetUni + daiTargetSushi;
+
+        // WETH -> DAI (Uniswap)
         (uint256 r0, uint256 r1) = getSortedReserves(WETHDAIuni, WETH);
-        inUni = getAmountIn(outUni, r0, r1);
-        wethIn += inUni;
-        (uint256 amount0Out, uint256 amount1Out) = getSortedOut(WETH, DAI, outUni);
-        
-        IERC20(WETH).transfer(WETHDAIuni, inUni);
-        IUniswapV2Pair(WETHDAIuni).swap(amount0Out, amount1Out, address(this), bytes(""));
+        uint256 inUniDAI = getAmountIn(daiTargetUni, r0, r1);
+        totalWethIn += inUniDAI;
+        (uint256 a0, uint256 a1) = getSortedOut(WETH, DAI, daiTargetUni);
+        IERC20(WETH).transfer(WETHDAIuni, inUniDAI);
+        IUniswapV2Pair(WETHDAIuni).swap(a0, a1, address(this), bytes(""));
 
-        // sushiswap
+        // WETH -> DAI (SushiSwap)
         (r0, r1) = getSortedReserves(WETHDAIsushi, WETH);
-        inSushi = getAmountIn(outSushi, r0, r1);
-        wethIn += inSushi;
-        (amount0Out, amount1Out) = getSortedOut(WETH, DAI, outSushi);
+        uint256 inSushiDAI = getAmountIn(daiTargetSushi, r0, r1);
+        totalWethIn += inSushiDAI;
+        (a0, a1) = getSortedOut(WETH, DAI, daiTargetSushi);
+        IERC20(WETH).transfer(WETHDAIsushi, inSushiDAI);
+        IUniswapV2Pair(WETHDAIsushi).swap(a0, a1, address(this), bytes(""));
 
-        IERC20(WETH).transfer(WETHDAIsushi, inSushi);
-        IUniswapV2Pair(WETHDAIsushi).swap(amount0Out, amount1Out, address(this), bytes(""));
+        // DAI -> USDC (Curve 3Pool Index 0 to 1)
+        IERC20(DAI).approve(address(curve), totalDaiToGet);
+        curve.exchange(0, 1, totalDaiToGet, 0); 
 
-        console.log("Swapped WETH to DAI: %s", formatUnits(wethIn, 18));
+        // (WETH -> USDC Direct)
+        uint256 usdcRemaining = stableOut - IERC20(USDC).balanceOf(address(this));
+        
+        // Split remaining USDC target between Uni and Sushi
+        uint256 usdcTargetUni = 732882243001;
+        uint256 usdcTargetSushi = usdcRemaining - usdcTargetUni;
+
+        if (usdcTargetUni > 0) {
+            (r0, r1) = getSortedReserves(WETHUSDCuni, WETH);
+            uint256 inUniUSDC = getAmountIn(usdcTargetUni, r0, r1);
+            totalWethIn += inUniUSDC;
+            (a0, a1) = getSortedOut(WETH, USDC, usdcTargetUni);
+            IERC20(WETH).transfer(WETHUSDCuni, inUniUSDC);
+            IUniswapV2Pair(WETHUSDCuni).swap(a0, a1, address(this), bytes(""));
+        }
+
+        if (usdcTargetSushi > 0) {
+            (r0, r1) = getSortedReserves(WETHUSDCsushi, WETH);
+            uint256 inSushiUSDC = getAmountIn(usdcTargetSushi, r0, r1);
+            totalWethIn += inSushiUSDC;
+            (a0, a1) = getSortedOut(WETH, USDC, usdcTargetSushi);
+            IERC20(WETH).transfer(WETHUSDCsushi, inSushiUSDC);
+            IUniswapV2Pair(WETHUSDCsushi).swap(a0, a1, address(this), bytes(""));
+        }
+
+        console.log("Total WETH spent for USDC repayment: %s", formatUnits(totalWethIn, 18));
     }
 
     function callFunction(address, ISoloMargin.Info calldata, bytes calldata data) external override {
-        (uint256 usdtToRepay, uint256 daiBorrowed) = abi.decode(data, (uint256, uint256));
+        (uint256 amount1, uint256 amount0) = abi.decode(data, (uint256, uint256));
 
-        // 1. DAI -> USDT (Curve 3Pool)
-        // Indices: 0 = DAI, 2 = USDT
-        IERC20(DAI).approve(address(curve), daiBorrowed);
-        curve.exchange(0, 2, daiBorrowed, 0); 
+        // USDC -> USDT (Curve 3Pool)
+        // 1 = USDC, 2 = USDT
+        IERC20(USDC).approve(address(curve), amount0);
+        curve.exchange(1, 2, amount0, 0); 
         
         uint256 usdtBalance = IERC20(USDT).balanceOf(address(this));
         console.log("USDT after Curve swap: %s", formatUnits(usdtBalance, 6));
 
-        // 2. Aave Liquidation
-        IERC20(USDT).approve(address(lendingPool), usdtToRepay);
-        lendingPool.liquidationCall(WBTC, USDT, TARGET_USER, usdtToRepay, false);
+        // Liquidation
+        IERC20(USDT).approve(address(lendingPool), amount1);    // aave needs this so the contract can take the money
+
+        // 2.1 liquidate the target user
+        //    *** Your code here ***
+        lendingPool.liquidationCall(
+            WBTC,
+            USDT,
+            TARGET_USER,
+            amount1,
+            false
+        );
 
         uint256 wbtcReceived = IERC20(WBTC).balanceOf(address(this));
         console.log("WBTC received: %s", formatUnits(wbtcReceived, 8));
 
-        // 3. WBTC -> WETH (Split Uni/Sushi)
+        // WBTC -> WETH (Split Uni/Sushi)
         _swapWBTCWETH(wbtcReceived);
 
-        // 4. WETH -> DAI to repay dYdX
-        uint256 daiToRepay = daiBorrowed + 2;
-        _swapWETHDAI(daiToRepay);
+        // WETH -> USDC to repay dYdX
+        uint256 usdcToRepay = amount0 + 2;
+        _swapWETHStable(usdcToRepay);
 
-        IERC20(DAI).approve(address(solo), daiToRepay);
+        IERC20(USDC).approve(address(solo), usdcToRepay);
     }
 
     function operate() external {
@@ -583,11 +637,10 @@ contract LiquidationOperator is ICallee {
         // says this at aave docs https://aave.com/help/borrowing/liquidations
         // (,, uint256 currentStableDebt, uint256 currentVariableDebt,,,,,) = dataProvider.getUserReserveData(USDT, TARGET_USER);
         // uint256 totalDebt = currentStableDebt + currentVariableDebt;
-        uint256 usdtToRepay = 2916378221684; // Close factor is usually 50%
+        uint256 usdtToRepay = 2916378221684; // Close factor is usually 50% but no more wbtc to claim anyways
 
-        // Borrow enough DAI to swap into the required USDT via Curve
-        // 2.916M USDT needs slightly more DAI if slippage occurs, but Curve is efficient.
-        uint256 daiToBorrow = 2916378221684 * 1e12; 
+        // Borrow USDC (6 decimals) to swap into USDT (6 decimals)
+        uint256 usdcToBorrow = 2920000000000; // some buffer here so we dont fail liquidation
 
         ISoloMargin.Info[] memory accounts = new ISoloMargin.Info[](1);
         accounts[0] = ISoloMargin.Info({owner: address(this), number: 0});
@@ -600,9 +653,9 @@ contract LiquidationOperator is ICallee {
                 sign: false,
                 denomination: ISoloMargin.AssetDenomination.Wei,
                 ref: ISoloMargin.AssetReference.Delta,
-                value: daiToBorrow
+                value: usdcToBorrow
             }),
-            primaryMarketId: 3, // DAI
+            primaryMarketId: 2, // USDC
             secondaryMarketId: 0,
             otherAddress: address(this),
             otherAccountId: 0,
@@ -621,7 +674,7 @@ contract LiquidationOperator is ICallee {
             secondaryMarketId: 0,
             otherAddress: address(this),
             otherAccountId: 0,
-            data: abi.encode(usdtToRepay, daiToBorrow)
+            data: abi.encode(usdtToRepay, usdcToBorrow)
         });
         actions[2] = ISoloMargin.ActionArgs({
             actionType: ISoloMargin.ActionType.Deposit,
@@ -630,9 +683,9 @@ contract LiquidationOperator is ICallee {
                 sign: true,
                 denomination: ISoloMargin.AssetDenomination.Wei,
                 ref: ISoloMargin.AssetReference.Delta,
-                value: daiToBorrow + 2 // 2 wei fee
+                value: usdcToBorrow + 2 // 2 wei fee
             }),
-            primaryMarketId: 3, // DAI
+            primaryMarketId: 2, // USDC
             secondaryMarketId: 0,
             otherAddress: address(this),
             otherAccountId: 0,
@@ -647,7 +700,7 @@ contract LiquidationOperator is ICallee {
             IWETH(WETH).withdraw(wethBalance);
         }
 
-        console.log("DAI: ", IERC20(DAI).balanceOf(address(this)));
+        console.log("USDC: ", IERC20(USDC).balanceOf(address(this)));
 
         // return ETH balance to caller
         uint256 ethBalance = address(this).balance;

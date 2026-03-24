@@ -1,96 +1,98 @@
 import numpy as np
-from scipy.optimize import minimize, minimize_scalar
+from scipy.optimize import minimize
 
-liqBonus = 1.1
-WBTCin = 94.27338222
-DAIout = 2920000
 
-WETHuni = 38844.42475154482370337
-WBTCuni = 2293.69102880
-WETHsushi = 88902.650478574486113986
-WBTCsushi = 5253.97180491
+WBTC_RECEIVED = 94.27338222
+USDC_TO_REPAY = 2916378.221684 + 0.000002 # Borrowed + fee (6 decimals)
 
-WETHuni1 = 25620.287386779241095276
-DAIuni1 = 51680858.415802498210642391
-WETHsushi1 = 50672.987628912073722125
-DAIsushi1 = 102278491.801378063064041805
+# WBTC/WETH Pools
+WETH_UNI = 38844.04247515448
+WBTC_UNI = 2293.69102880
+WETH_SUSHI = 88902.65047857448
+WBTC_SUSHI = 5253.97180491
 
-WETHuni2 = 53146.035951023773605158
-USDCuni2 = 107391732.922008
-WETHsushi2 = 82306.099800901231324544
-USDCsushi2 = 166057035.198029
+# WETH/DAI Pools (Path A)
+WETH_DAI_UNI = 25620.28738677924
+DAI_UNI = 51680858.4158025
+WETH_DAI_SUSHI = 50672.98762891207
+DAI_SUSHI = 102278491.801378
 
-pools1 = [
-    [WBTCuni, WETHuni],
-    [WBTCsushi, WETHsushi]
-]
+# WETH/USDC Pools (Path B)
+WETH_USDC_UNI = 53146.03595102377
+USDC_UNI = 107391732.922008
+WETH_USDC_SUSHI = 82306.09980090123
+USDC_SUSHI = 166057035.198029
 
-pools2 = [
-    [WETHuni1, DAIuni1],
-    [WETHsushi1, DAIsushi1],
-    [WETHuni2, USDCuni2],
-    [WETHsushi2, USDCsushi2]
-]
+CURVE_FEE = 0.0004
 
 def getAmountIn(rIn, rOut, dy):
-    # given amountOut, give amountIn
-    num = rIn * dy
-    den = (rOut - dy) * .997
-    return num / den
+    if dy <= 0: return 0
+    if dy >= rOut: return 1e18 # Prevent pool draining
+    return (rIn * dy * 1000) / ((rOut - dy) * 997)
 
 def getAmountOut(rIn, rOut, dx):
-    # given amountIn, give amountOut
-    dxFee = dx * .997
-    num = dxFee * rOut
-    den = rIn + dxFee
-    return num / den
+    if dx <= 0: return 0
+    dxFee = dx * 997
+    return (dxFee * rOut) / (rIn * 1000 + dxFee)
 
-def optimiseSplitOut(totalIn, pools):
+
+def optimize_wbtc_to_weth(total_wbtc):
     def objective(x):
-        totalOut = -sum(getAmountOut(pools[i][0], pools[i][1], x[i]) for i in range(len(x)))
-        return totalOut
+        # x is amount of WBTC to Uni
+        out_uni = getAmountOut(WBTC_UNI, WETH_UNI, x)
+        out_sushi = getAmountOut(WBTC_SUSHI, WETH_SUSHI, total_wbtc - x)
+        return -(out_uni + out_sushi) # Maximize WETH out
 
-    cons = ({'type': 'eq', 'fun': lambda x: sum(x) - totalIn})
-    bounds = [(0, totalIn) for _ in pools]
-    init_guess = [totalIn / len(pools)] * len(pools)
+    res = minimize(objective, x0=total_wbtc/2, bounds=[(0, total_wbtc)])
+    return res.x[0], -res.fun
 
-    res = minimize(objective, init_guess, method="SLSQP", bounds=bounds, constraints=cons)
 
-    return res
-
-def optimiseSplitIn(totalOut, pools):
-    # y0 is the USDT taken from pool 0. Pool 1 takes the rest.
-    def objective(y0):
-        y1 = totalOut - y0
-        return getAmountIn(pools[0][0], pools[0][1], y0) + getAmountIn(pools[1][0], pools[1][1], y1)
-
-    # Ensure we don't drain more than 99% of either pool
-    max_y0 = min(totalOut, pools[0][1] * 0.99)
-    min_y0 = max(0, totalOut - pools[1][1] * 0.99)
-
-    res = minimize_scalar(objective, bounds=(min_y0, max_y0), method='bounded')
-    
-    usdt_split = [res.x, totalOut - res.x]
-    weth_split = [
-        getAmountIn(pools[0][0], pools[0][1], usdt_split[0]), 
-        getAmountIn(pools[1][0], pools[1][1], usdt_split[1])
+def optimize_repayment(total_usdc_needed):
+    # Proportional initial guess based on liquidity
+    total_liq = DAI_UNI + DAI_SUSHI + USDC_UNI + USDC_SUSHI
+    init_guess = [
+        total_usdc_needed * (DAI_UNI / total_liq),
+        total_usdc_needed * (DAI_SUSHI / total_liq),
+        total_usdc_needed * (USDC_UNI / total_liq),
+        total_usdc_needed * (USDC_SUSHI / total_liq)
     ]
+
+    def objective(x):
+        # Scale units to "millions" internally to help the solver with precision
+        weth_uni_dai = getAmountIn(WETH_DAI_UNI, DAI_UNI, x[0])
+        weth_sushi_dai = getAmountIn(WETH_DAI_SUSHI, DAI_SUSHI, x[1])
+        weth_uni_usdc = getAmountIn(WETH_USDC_UNI, USDC_UNI, x[2])
+        weth_sushi_usdc = getAmountIn(WETH_USDC_SUSHI, USDC_SUSHI, x[3])
+        return weth_uni_dai + weth_sushi_dai + weth_uni_usdc + weth_sushi_usdc
+
+    def constraint(x):
+        usdc_from_dai = (x[0] + x[1]) * (1 - CURVE_FEE)
+        usdc_direct = x[2] + x[3]
+        return usdc_from_dai + usdc_direct - total_usdc_needed
+
+    cons = {'type': 'eq', 'fun': constraint}
+    bounds = [(0, DAI_UNI*0.5), (0, DAI_SUSHI*0.5), (0, USDC_UNI*0.5), (0, USDC_SUSHI*0.5)]
     
-    return usdt_split, weth_split
+    # Use a smaller tolerance and more iterations
+    res = minimize(objective, init_guess, method='SLSQP', bounds=bounds, constraints=cons, 
+                   options={'ftol': 1e-12, 'maxiter': 1000})
+    
+    if not res.success:
+        print("Warning: Solver did not converge!")
+        
+    return res.x, res.fun
 
-# Execution
-usdt_split, weth_split = optimiseSplitIn(DAIout, pools2)
-print("Optimal DAI split:", usdt_split)
-print("Optimal WETH in:", weth_split)
-print("Total WETH required:", sum(weth_split))
+wbtc_uni_split, total_weth_received = optimize_wbtc_to_weth(WBTC_RECEIVED)
+repay_splits, min_weth_cost = optimize_repayment(USDC_TO_REPAY)
 
-res = optimiseSplitOut(WBTCin, pools1)
-print(res)
-print(res["x"])
+print(f"Uni:   {wbtc_uni_split:.8f} WBTC")
+print(f"Sushi: {WBTC_RECEIVED - wbtc_uni_split:.8f} WBTC")
+print(f"Total WETH Out: {total_weth_received:.18f}")
 
-print(getAmountOut(WBTCsushi, WETHsushi, WBTCin))
+print(f"Path A (DAI Uni):   {repay_splits[0]:.18f}")
+print(f"Path A (DAI Sushi): {repay_splits[1]:.18f}")
+print(f"Path B (USDC Uni):  {repay_splits[2]:.18f}")
+print(f"Path B (USDC Sushi):{repay_splits[3]:.18f}")
+print(f"Total WETH Cost: {min_weth_cost:.18f}")
 
-# res = optimiseSplitIn(USDTout, pools2)
-# print(res)
-# print(res["x"])
-# print(sum(res["x"]))
+print(f"Estimated Profit: {total_weth_received - min_weth_cost:.18f} ETH")
