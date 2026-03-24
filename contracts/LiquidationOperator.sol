@@ -88,32 +88,71 @@ interface IProtocolDataProvider {
         );
 }
 
-// needed for IProtocolOracle as no imports allowed
-// https://github.com/aave/protocol-v2/blob/master/contracts/interfaces/IChainlinkAggregator.sol
-interface IChainlinkAggregator {
-  function decimals() external view returns (uint8);
-  
-  function latestAnswer() external view returns (int256);
+// Curve 3pool
+interface ICurve3Pool {
+    function exchange(
+        int128 i,
+        int128 j,
+        uint256 dx,
+        uint256 min_dy
+    ) external; // No return value on 3pool
 
-  function latestTimestamp() external view returns (uint256);
-
-  function latestRound() external view returns (uint256);
-
-  function getAnswer(uint256 roundId) external view returns (int256);
-
-  function getTimestamp(uint256 roundId) external view returns (uint256);
-
-  event AnswerUpdated(int256 indexed current, uint256 indexed roundId, uint256 timestamp);
-  event NewRound(uint256 indexed roundId, address indexed startedBy);
+    function get_dy(
+        int128 i,
+        int128 j,
+        uint256 dx
+    ) external view returns (uint256);
 }
 
-// protocol oracle, used to export prices to python script
-// https://github.com/aave/protocol-v2/blob/master/contracts/misc/AaveOracle.sol
-interface IProtocolOracle {
-    function getAssetPrice(address asset) external view returns (uint256);
+// dYdX Solo Margin
+interface ISoloMargin {
+    struct Info {
+        address owner;
+        uint256 number;
+    }
+
+    enum ActionType {
+        Deposit,   // 0
+        Withdraw,  // 1
+        Transfer,  // 2
+        Buy,       // 3
+        Sell,      // 4
+        Trade,     // 5
+        Liquidate, // 6
+        Vaporize,  // 7
+        Call       // 8
+    }
+
+    enum AssetDenomination { Wei, Par }
+    enum AssetReference { Delta, Target }
+
+    struct AssetAmount {
+        bool sign;
+        AssetDenomination denomination;
+        AssetReference ref;
+        uint256 value;
+    }
+
+    struct ActionArgs {
+        ActionType actionType;
+        uint256 accountId;
+        AssetAmount amount;
+        uint256 primaryMarketId;
+        uint256 secondaryMarketId;
+        address otherAddress;
+        uint256 otherAccountId;
+        bytes data;
+    }
+
+    function operate(Info[] memory accounts, ActionArgs[] memory actions) external;
 }
 
-interface ICurve {
+interface ICallee {
+    function callFunction(
+        address sender,
+        ISoloMargin.Info calldata account,
+        bytes calldata data
+    ) external;
 }
 // balancer v2
 // 0% flash loan, good life, save money
@@ -141,25 +180,6 @@ interface IBPool {
         uint swapFee
     ) external pure returns (uint tokenAmountOut);
 
-}
-
-// utility interfaces for IBPool, currently needed due to no imports allowed
-interface IFlashLoanRecipient {
-    function receiveFlashLoan(
-        IERC20[] memory tokens,
-        uint256[] memory amounts,
-        uint256[] memory feeAmounts,
-        bytes memory userData
-    ) external;
-}
-
-interface IVault {
-    function flashLoan(
-        IFlashLoanRecipient recipient,
-        IERC20[] memory tokens,
-        uint256[] memory amounts,
-        bytes memory userData
-    ) external;
 }
 
 // UniswapV2
@@ -247,11 +267,11 @@ interface IUniswapV2Pair {
 
 // ----------------------IMPLEMENTATION------------------------------
 
-contract LiquidationOperator is IFlashLoanRecipient {
-    IVault private constant vault = IVault(0xBA12222222228d8Ba445958a75a0704d566BF2C8);
+contract LiquidationOperator is ICallee {
+    ISoloMargin private constant solo = ISoloMargin(0x1E0447b19BB6EcFdAe1e4AE1694b0C3659614e4e);
+    ICurve3Pool private constant curve = ICurve3Pool(0xbEbc44782C7dB0a1A60Cb6fe97d0b483032FF1C7);
     ILendingPool constant lendingPool = ILendingPool(0x7d2768dE32b0b80b7a3454c06BdAc94A69DDc7A9);
     IProtocolDataProvider constant dataProvider = IProtocolDataProvider(0x057835Ad21a177dbdd3090bB1CAE03EaCF78Fc6d);
-    IProtocolOracle constant oracle = IProtocolOracle(0xA50ba011c48153De246E5192C8f9258A2ba79Ca9);
 
     address constant USDT = 0xdAC17F958D2ee523a2206206994597C13D831ec7;
     address constant WBTC = 0x2260FAC5E5542a773Aa44fBCfeDf7C193bc2C599;
@@ -436,10 +456,6 @@ contract LiquidationOperator is IFlashLoanRecipient {
             
         ) = dataProvider.getReserveConfigurationData(WBTC);
 
-        // spits out the prices relative to eth
-        uint256 oracleWBTC = oracle.getAssetPrice(WBTC);
-        uint256 oracleUSDT = oracle.getAssetPrice(USDT);
-
         uint256 totalDebt = currentStableDebt + currentVariableDebt;
         // wbtcCollateral = wbtcCollateral * 1e8 / oracleWBTC;
 
@@ -452,9 +468,6 @@ contract LiquidationOperator is IFlashLoanRecipient {
         require(totalDebt / 2 > 0, "No debt to liquidate");
         console.log("User has USDT debt: %s", formatUnits(totalDebt, 6));
         console.log("User has WBTC collateral: %s", formatUnits(wbtcCollateral, 8));
-
-        console.log("Oracle WBTC price: %s", formatUnits(oracleWBTC, 18));
-        console.log("Oracle USDT price: %s", formatUnits(oracleUSDT, 18)); // Standardized to 18 if Chainlink
 
         (uint256 r0, uint256 r1) = getSortedReserves(WBTCUSDTuni, WBTC);
         console.log("Uni WBTC/USDT | WBTC: %s, USDT: %s", formatUnits(r0, 8), formatUnits(r1, 6));
@@ -508,89 +521,135 @@ contract LiquidationOperator is IFlashLoanRecipient {
         console.log("WETH from WBTC swap: %s", formatUnits(wethOut, 18));
     }
 
-    function _swapWETHUSDT(uint256 usdtOut) internal {
-        uint256 outUni = 1310806629343;
-        uint256 outSushi = usdtOut - outUni; 
+    function _swapWETHDAI(uint256 daiOut) internal {
+        uint256 wethIn;
+        uint256 outUni = 970018074860588300000000; // precomputed magic number
+        uint256 outSushi = daiOut - outUni; 
         uint256 inUni;
         uint256 inSushi;
 
         // uniswap
-        (uint256 r0, uint256 r1) = getSortedReserves(WETHUSDTuni, WETH);
+        (uint256 r0, uint256 r1) = getSortedReserves(WETHDAIuni, WETH);
         inUni = getAmountIn(outUni, r0, r1);
-        (uint256 amount0Out, uint256 amount1Out) = getSortedOut(WETH, USDT, outUni);
+        wethIn += inUni;
+        (uint256 amount0Out, uint256 amount1Out) = getSortedOut(WETH, DAI, outUni);
         
-        IERC20(WETH).transfer(WETHUSDTuni, inUni);
-        IUniswapV2Pair(WETHUSDTuni).swap(amount0Out, amount1Out, address(this), bytes(""));
+        IERC20(WETH).transfer(WETHDAIuni, inUni);
+        IUniswapV2Pair(WETHDAIuni).swap(amount0Out, amount1Out, address(this), bytes(""));
 
-        // sushiswap (Fixed pair, tokens, and math)
-        (r0, r1) = getSortedReserves(WETHUSDTsushi, WETH);
+        // sushiswap
+        (r0, r1) = getSortedReserves(WETHDAIsushi, WETH);
         inSushi = getAmountIn(outSushi, r0, r1);
-        (amount0Out, amount1Out) = getSortedOut(WETH, USDT, outSushi);
+        wethIn += inSushi;
+        (amount0Out, amount1Out) = getSortedOut(WETH, DAI, outSushi);
 
-        IERC20(WETH).transfer(WETHUSDTsushi, inSushi);
-        IUniswapV2Pair(WETHUSDTsushi).swap(amount0Out, amount1Out, address(this), bytes(""));
+        IERC20(WETH).transfer(WETHDAIsushi, inSushi);
+        IUniswapV2Pair(WETHDAIsushi).swap(amount0Out, amount1Out, address(this), bytes(""));
 
-        console.log("Swapped WETH to USDT");
+        console.log("Swapped WETH to DAI: %s", formatUnits(wethIn, 18));
     }
 
-    function makeFlashLoan(IERC20[] memory tokens, uint256[] memory amounts, bytes memory userData) internal {
-        vault.flashLoan(this, tokens, amounts, userData);
-    }
+    function callFunction(address, ISoloMargin.Info calldata, bytes calldata data) external override {
+        (uint256 usdtToRepay, uint256 daiBorrowed) = abi.decode(data, (uint256, uint256));
 
-    function receiveFlashLoan(
-        IERC20[] memory tokens,
-        uint256[] memory amounts,
-        uint256[] memory feeAmounts,
-        bytes memory userData
-    ) external override {
-        require(msg.sender == address(vault));
-        IERC20(USDT).approve(address(lendingPool), amounts[0]);    // aave needs this so the contract can take the money
+        // 1. DAI -> USDT (Curve 3Pool)
+        // Indices: 0 = DAI, 2 = USDT
+        IERC20(DAI).approve(address(curve), daiBorrowed);
+        curve.exchange(0, 2, daiBorrowed, 0); 
+        
+        uint256 usdtBalance = IERC20(USDT).balanceOf(address(this));
+        console.log("USDT after Curve swap: %s", formatUnits(usdtBalance, 6));
 
-    // // //     // 2.1 liquidate the target user
-    // // //     //    *** Your code here ***
-        lendingPool.liquidationCall(
-            WBTC,
-            USDT,
-            TARGET_USER,
-            amounts[0],
-            false
-        );
+        // 2. Aave Liquidation
+        IERC20(USDT).approve(address(lendingPool), usdtToRepay);
+        lendingPool.liquidationCall(WBTC, USDT, TARGET_USER, usdtToRepay, false);
 
         uint256 wbtcReceived = IERC20(WBTC).balanceOf(address(this));
-        console.log("WBTC from liquidation: %s", formatUnits(wbtcReceived, 8));
+        console.log("WBTC received: %s", formatUnits(wbtcReceived, 8));
 
-        // 2.2 swap WBTC for other things or repay directly
+        // 3. WBTC -> WETH (Split Uni/Sushi)
         _swapWBTCWETH(wbtcReceived);
-        _swapWETHUSDT(amounts[0]);
-    //     // local variable stack space saver
-    //     // _swapWBTCWETH(wbtcReceived);
 
-        // 2.3 repay
-        for (uint256 i = 0; i < tokens.length; i++) {
-            tokens[i].transfer(address(vault), amounts[i] + feeAmounts[i]);
-        }
+        // 4. WETH -> DAI to repay dYdX
+        uint256 daiToRepay = daiBorrowed + 2;
+        _swapWETHDAI(daiToRepay);
+
+        IERC20(DAI).approve(address(solo), daiToRepay);
     }
 
     function operate() external {
         _getSolverInfo();
-        IERC20[] memory tokens = new IERC20[](1);
-        tokens[0] = IERC20(USDT);
+        
+        // says this at aave docs https://aave.com/help/borrowing/liquidations
+        // (,, uint256 currentStableDebt, uint256 currentVariableDebt,,,,,) = dataProvider.getUserReserveData(USDT, TARGET_USER);
+        // uint256 totalDebt = currentStableDebt + currentVariableDebt;
+        uint256 usdtToRepay = 2916378221684; // Close factor is usually 50%
 
-        uint256[] memory amounts = new uint256[](1);
-        amounts[0] = 2916378221684;
+        // Borrow enough DAI to swap into the required USDT via Curve
+        // 2.916M USDT needs slightly more DAI if slippage occurs, but Curve is efficient.
+        uint256 daiToBorrow = 2916378221684 * 1e12; 
 
-        uint256[] memory feeAmounts = new uint256[](1);
-        feeAmounts[0] = 0;
+        ISoloMargin.Info[] memory accounts = new ISoloMargin.Info[](1);
+        accounts[0] = ISoloMargin.Info({owner: address(this), number: 0});
 
-        bytes memory userData = "";
+        ISoloMargin.ActionArgs[] memory actions = new ISoloMargin.ActionArgs[](3);
+        actions[0] = ISoloMargin.ActionArgs({
+            actionType: ISoloMargin.ActionType.Withdraw,
+            accountId: 0,
+            amount: ISoloMargin.AssetAmount({
+                sign: false,
+                denomination: ISoloMargin.AssetDenomination.Wei,
+                ref: ISoloMargin.AssetReference.Delta,
+                value: daiToBorrow
+            }),
+            primaryMarketId: 3, // DAI
+            secondaryMarketId: 0,
+            otherAddress: address(this),
+            otherAccountId: 0,
+            data: ""
+        });
+        actions[1] = ISoloMargin.ActionArgs({
+            actionType: ISoloMargin.ActionType.Call,
+            accountId: 0,
+            amount: ISoloMargin.AssetAmount({
+                sign: false,
+                denomination: ISoloMargin.AssetDenomination.Wei,
+                ref: ISoloMargin.AssetReference.Delta,
+                value: 0
+            }),
+            primaryMarketId: 0,
+            secondaryMarketId: 0,
+            otherAddress: address(this),
+            otherAccountId: 0,
+            data: abi.encode(usdtToRepay, daiToBorrow)
+        });
+        actions[2] = ISoloMargin.ActionArgs({
+            actionType: ISoloMargin.ActionType.Deposit,
+            accountId: 0,
+            amount: ISoloMargin.AssetAmount({
+                sign: true,
+                denomination: ISoloMargin.AssetDenomination.Wei,
+                ref: ISoloMargin.AssetReference.Delta,
+                value: daiToBorrow + 2 // 2 wei fee
+            }),
+            primaryMarketId: 3, // DAI
+            secondaryMarketId: 0,
+            otherAddress: address(this),
+            otherAccountId: 0,
+            data: ""
+        });
 
-        makeFlashLoan(tokens, amounts, userData);
+        solo.operate(accounts, actions);
+
+        // Convert profit
         uint256 wethBalance = IERC20(WETH).balanceOf(address(this));
         if (wethBalance > 0) {
             IWETH(WETH).withdraw(wethBalance);
         }
 
-        // // return ETH balance to caller
+        console.log("DAI: ", IERC20(DAI).balanceOf(address(this)));
+
+        // return ETH balance to caller
         uint256 ethBalance = address(this).balance;
         if (ethBalance > 0) {
             (bool success, ) = _owner.call{value:ethBalance}("");
